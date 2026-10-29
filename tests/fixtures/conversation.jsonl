@@ -1,0 +1,9 @@
+{"type":"user","cwd":"/tmp/project","message":{"role":"user","content":"why does the login test fail on CI?"}}
+{"type":"user","isMeta":true,"cwd":"/tmp/project","message":{"role":"user","content":"meta line that is not a prompt"}}
+{"type":"user","cwd":"/tmp/project","message":{"role":"user","content":"<command-name>/clear</command-name>"}}
+{"type":"assistant","cwd":"/tmp/project","message":{"role":"assistant","content":[{"type":"text","text":"The test reads the cookie before the redirect sets it."},{"type":"tool_use","name":"Read","input":{}}]}}
+{"type":"user","cwd":"/tmp/project","message":{"role":"user","content":[{"type":"tool_result","content":"file body"}]}}
+{"type":"ai-title","aiTitle":"Flaky login test"}
+not json at all
+{"type":"user","cwd":"/tmp/project","message":{"role":"user","content":"[Request interrupted by user]"}}
+{"type":"ai-title","aiTitle":"Flaky login test investigation"}

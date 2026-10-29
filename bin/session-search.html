@@ -1,0 +1,225 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Search Sessions</title>
+<style>
+  :root {
+    --bg: var(--agterm-background, #1d2023);
+    --fg: var(--agterm-foreground, #d8d4cc);
+    --accent: var(--agterm-color-4, #6d82f3);
+    --hit: var(--agterm-color-3, #e0b34f);
+    --green: var(--agterm-color-2, #7fb35e);
+    --red: var(--agterm-color-1, #e06c75);
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg);
+    font: 13px/1.45 -apple-system, BlinkMacSystemFont, sans-serif; }
+  body { display: flex; flex-direction: column; }
+  #q { margin: 12px 12px 6px; padding: 9px 12px; font-size: 15px; color: var(--fg); background: transparent;
+    border: 1px solid color-mix(in srgb, var(--fg) 25%, transparent); border-radius: 8px; outline: none; }
+  #q:focus { border-color: var(--accent); }
+  #meta { margin: 0 14px 6px; font-size: 11px; opacity: .5; }
+  #list { flex: 1; overflow-y: auto; padding: 0 8px 10px; }
+  .row { padding: 7px 10px; border-radius: 7px; cursor: default; }
+  .row.sel { background: color-mix(in srgb, var(--accent) 22%, transparent); }
+  .head { display: flex; gap: 8px; align-items: baseline; white-space: nowrap; }
+  .name { font-weight: 600; overflow: hidden; text-overflow: ellipsis; }
+  .where { font-size: 11px; opacity: .55; overflow: hidden; text-overflow: ellipsis; }
+  .dot { width: 7px; height: 7px; border-radius: 50%; flex: none; align-self: center; }
+  .dot.active { background: var(--accent); } .dot.blocked { background: var(--red); } .dot.completed { background: var(--green); }
+  .line { font-size: 12px; opacity: .8; margin-top: 2px; display: -webkit-box; -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical; overflow: hidden; }
+  .snip { font: 11.5px/1.4 ui-monospace, Menlo, monospace; opacity: .7; margin-top: 3px; white-space: nowrap;
+    overflow: hidden; text-overflow: ellipsis; }
+  .tag { font-size: 10px; text-transform: uppercase; letter-spacing: .04em; opacity: .5; margin-right: 6px; }
+  mark { background: none; color: var(--hit); font-weight: 600; }
+  #empty { padding: 20px; opacity: .5; text-align: center; }
+  .row.closed { opacity: .6; } .row.closed.sel { opacity: .9; }
+  .dot.closed { background: none; border: 1px dashed currentColor; width: 8px; height: 8px; }
+  .when { margin-left: auto; padding-left: 12px; font-size: 10px; text-transform: uppercase; letter-spacing: .04em;
+    opacity: .6; }
+  .divider { margin: 12px 10px 4px; padding-top: 8px; font-size: 10px; text-transform: uppercase; letter-spacing: .06em;
+    opacity: .45; border-top: 1px dashed color-mix(in srgb, var(--fg) 40%, transparent); }
+</style>
+</head>
+<body>
+<input id="q" placeholder="Search name, context, Claude summary, prompts, scrollback…" autofocus spellcheck="false">
+<div id="meta"></div>
+<div id="list"></div>
+<script type="module">
+const SESSIONS = /*SESSIONS*/[];
+// field -> weight; a term matching a heavier field ranks the session higher
+const FIELDS = [['name', 10], ['context', 9], ['title', 8], ['summary', 6], ['workspace', 4], ['cwd', 3],
+  ['prompts', 2], ['scroll', 1]];
+const SNIPPET_FIELDS = ['summary', 'prompts', 'scroll'];
+const SNIPPET_LABELS = {summary: 'summary', prompts: 'conversation', scroll: 'scroll'};
+// a guessed "newest conversation in this directory" ranks below what the session itself shows
+const GUESSED = new Set(['title', 'summary', 'prompts']), GUESSED_WEIGHT = 0.4;
+// roughly what the two-line clamp shows of the summary line; a match past it needs a snippet
+const LINE_VISIBLE = 150;
+const SCROLL_LINES = 400;
+// closed results always come after every open session, whatever their score
+const GROUP = {open: 0, recent: 1, conversation: 2};
+const DIVIDER = {recent: 'Recently closed', conversation: 'Past Claude conversations'};
+
+const $q = document.getElementById('q'), $list = document.getElementById('list'), $meta = document.getElementById('meta');
+let results = [], sel = 0, scrollLoaded = 0;
+
+for (const s of SESSIONS) {
+  const exact = s.claude.filter(c => c.exact), convs = exact.length ? exact : s.claude;
+  s.title = convs.map(c => c.title).join(' · ');
+  s.summary = convs.map(c => c.summary).filter(Boolean).join(' ');
+  s.prompts = convs.map(c => c.text).join('\n');
+  s.fromDir = !exact.length && s.claude.length > 0;
+  s.scroll = '';
+  for (const f of ['name', 'context', 'title', 'summary', 'workspace', 'cwd', 'prompts']) s['_' + f] = s[f].toLowerCase();
+  s._scroll = '';
+}
+
+const esc = t => t.replace(/[&<>"]/g, c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;'}[c]));
+
+function highlight(text, terms) {
+  if (!terms.length) return esc(text);
+  const re = new RegExp('(' + terms.map(t => t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|') + ')', 'gi');
+  return text.split(re).map((p, i) => i % 2 ? '<mark>' + esc(p) + '</mark>' : esc(p)).join('');
+}
+
+// one snippet per term the row does not already show, so every match on the row is visible
+function snippets(s, terms, visible) {
+  const out = [];
+  for (const t of terms) {
+    if (visible.includes(t) || out.some(o => o.lower.includes(t))) continue;
+    for (const f of s.fromDir ? ['scroll', ...SNIPPET_FIELDS] : SNIPPET_FIELDS) {
+      const lower = s['_' + f], i = lower.indexOf(t);
+      if (i < 0) continue;
+      const start = Math.max(0, lower.lastIndexOf('\n', i) + 1, i - 60);
+      let end = lower.indexOf('\n', i); if (end < 0 || end - i > 140) end = i + 140;
+      const text = (start > 0 ? '…' : '') + s[f].slice(start, end).replace(/\s+/g, ' ');
+      out.push({field: f, text, lower: text.toLowerCase()});
+      break;
+    }
+  }
+  return out;
+}
+
+function search() {
+  const terms = $q.value.toLowerCase().split(/\s+/).filter(Boolean);
+  results = [];
+  for (const s of SESSIONS) {
+    let score = 0, ok = true;
+    for (const t of terms) {
+      let best = 0;
+      for (const [f, w] of FIELDS) {
+        const i = s['_' + f].indexOf(t);
+        if (i < 0) continue;
+        const weight = s.fromDir && GUESSED.has(f) ? w * GUESSED_WEIGHT : w;
+        best = Math.max(best, weight * (i === 0 || /\W/.test(s['_' + f][i - 1]) ? 1.5 : 1));
+      }
+      if (!best) { ok = false; break; }
+      score += best;
+    }
+    if (ok) results.push({s, score});
+  }
+  // with no query: the current session last, so Return jumps somewhere useful
+  const byGroup = (a, b) => GROUP[a.s.kind] - GROUP[b.s.kind];
+  if (terms.length) results.sort((a, b) => byGroup(a, b) || b.score - a.score);
+  else results.sort((a, b) => byGroup(a, b) || (a.s.kind === 'open' ? a.s.active - b.s.active : b.s.closedAt - a.s.closedAt));
+  sel = 0;
+  render(terms);
+}
+
+function render(terms) {
+  if (!results.length) { $list.innerHTML = '<div id="empty">No matching session</div>'; return; }
+  const windows = new Set(SESSIONS.filter(x => x.kind === 'open').map(x => x.window));
+  $list.innerHTML = results.map(({s}, i) => {
+    const divider = s.kind !== 'open' && results[i - 1]?.s.kind !== s.kind ? `<div class="divider">${DIVIDER[s.kind]}</div>` : '';
+    const closed = s.kind !== 'open';
+    const where = [s.workspace, s.cwd.replace(/^\/Users\/[^/]+/, '~')].filter(Boolean)
+      .concat(!closed && windows.size > 1 ? [s.windowName] : []);
+    const when = s.kind === 'recent' ? `closed ${ago(s.closedAt)} · reopen` : s.kind === 'conversation' ? `${ago(s.closedAt)} · resume` : '';
+    let line = s.context || s.summary || s.title;
+    const lineTag = s.context ? '' : (s.fromDir ? 'claude in dir' : s.summary ? 'claude' : 'title');
+    const visible = [s.name, where.join(' '), line.slice(0, LINE_VISIBLE)].join('\n').toLowerCase();
+    const snips = terms.length ? snippets(s, terms, visible) : [];
+    return `${divider}<div class="row${i === sel ? ' sel' : ''}${closed ? ' closed' : ''}" data-i="${i}">
+      <div class="head"><span class="dot ${closed ? 'closed' : s.status}"></span><span class="name">${highlight(s.name, terms)}</span>
+        <span class="where">${highlight(where.join(' · '), terms)}</span>${when ? `<span class="when">${when}</span>` : ''}</div>
+      ${line ? `<div class="line">${lineTag ? `<span class="tag">${lineTag}</span>` : ''}${highlight(line, terms)}</div>` : ''}
+      ${snips.map(n => `<div class="snip"><span class="tag">${SNIPPET_LABELS[n.field]}</span>${highlight(n.text, terms)}</div>`).join('')}
+    </div>`;
+  }).join('');
+  $list.querySelector('.sel')?.scrollIntoView({block: 'nearest'});
+}
+
+function move(d) {
+  if (!results.length) return;
+  sel = (sel + d + results.length) % results.length;
+  $list.querySelectorAll('.row').forEach((r, i) => r.classList.toggle('sel', i === sel));
+  $list.querySelector('.sel')?.scrollIntoView({block: 'nearest'});
+}
+
+function ago(sec) {
+  const m = Math.max(0, Date.now() / 1000 - sec) / 60;
+  return m < 60 ? `${Math.round(m)}m ago` : m < 1440 ? `${Math.round(m / 60)}h ago` : `${Math.round(m / 1440)}d ago`;
+}
+
+async function go(i) {
+  const s = results[i]?.s;
+  if (!s) return;
+  try {
+    if (s.kind === 'recent') {
+      // back under its original id, in this window unless another window still holds its workspace
+      const r = await agterm.request('recent.open', {target: s.id});
+      const win = r?.recentOpen?.window;
+      if (win) await agterm.request('window.select', {target: win});
+      if (s.sessionIDs[0]) await agterm.request('session.select', {target: s.sessionIDs[0], args: win ? {window: win} : {}});
+    } else if (s.kind === 'conversation') {
+      const r = await agterm.request('session.new', {args: {cwd: s.cwd}});
+      await agterm.request('session.type', {target: r.id, args: {text: `claude --resume ${s.id}\n`, select: true}});
+    } else {
+      if (!s.windowActive) await agterm.request('window.select', {target: s.window});
+      await agterm.request('session.select', {target: s.id, args: {window: s.window}});
+    }
+  } finally {
+    close();
+  }
+}
+
+function close() {
+  agterm.request('session.overlay.close').catch(() => window.close());
+}
+
+$q.addEventListener('input', search);
+document.addEventListener('keydown', e => {
+  const k = e.key;
+  if (k === 'ArrowDown' || (e.ctrlKey && (k === 'j' || k === 'n'))) { move(1); e.preventDefault(); }
+  else if (k === 'ArrowUp' || (e.ctrlKey && (k === 'k' || k === 'p'))) { move(-1); e.preventDefault(); }
+  else if (k === 'Enter') { go(sel); e.preventDefault(); }
+  else if (k === 'Escape') { close(); e.preventDefault(); }
+});
+$list.addEventListener('click', e => { const r = e.target.closest('.row'); if (r) go(+r.dataset.i); });
+
+function updateMeta() {
+  const realized = SESSIONS.filter(s => s.realized).length, count = k => SESSIONS.filter(s => s.kind === k).length;
+  $meta.textContent = `${count('open')} open · ${count('recent')} recently closed · ${count('conversation')} past conversations`
+    + ` · scrollback ${scrollLoaded}/${realized}`;
+}
+
+search();
+updateMeta();
+$q.focus();
+
+// scrollback arrives after first paint; re-run the query as each buffer lands
+for (const s of SESSIONS.filter(s => s.realized)) {
+  agterm.request('session.text', {target: s.id, args: {lines: SCROLL_LINES, window: s.window}}).then(r => {
+    s.scroll = r?.text || '';
+    s._scroll = s.scroll.toLowerCase();
+    scrollLoaded++;
+    updateMeta();
+    if ($q.value.trim()) { const keep = results[sel]?.s; search(); const j = results.findIndex(x => x.s === keep); if (j >= 0) { sel = j; render($q.value.toLowerCase().split(/\s+/).filter(Boolean)); } }
+  }).catch(() => {});
+}
+</script>
+</body>
+</html>
