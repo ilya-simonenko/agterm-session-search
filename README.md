@@ -8,6 +8,8 @@ conversation.
 An optional Claude Code hook also names each session after its conversation, with an emoji picked to match
 the topic: `🧪 Flaky login test investigation`.
 
+![Searching "migration": an open session matched by name and another by its scrollback, then a recently closed session and a past Claude conversation matched by their summaries](docs/search-query.png)
+
 ## What it does
 
 Press ⌃⌥P and a search panel opens over the current session. Type a few words; every word has to match
@@ -25,6 +27,8 @@ Results come in three groups, always in this order:
 
 Closed results are dimmed, carry a dashed status ring, and say when they were closed and what Return does.
 Arrows or ⌃J/⌃K/⌃N/⌃P move, Return acts, Esc closes.
+
+![With no query: open sessions with their status and Claude summaries, then recently closed sessions and past conversations](docs/search-all.png)
 
 ### Where the Claude summary comes from
 
@@ -117,6 +121,9 @@ make lint test
 ```
 
 The tests run the installer against a throwaway `HOME`; they never touch your agterm or Claude Code config.
+
+`docs/make-screenshots.py` regenerates the screenshots from a made-up demo index rendered by the shipped page,
+so no real session ever lands in them.
 
 ## License
 
