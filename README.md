@@ -48,7 +48,7 @@ summarized for the next search. Until then it is still found by its title and it
 ## Install
 
 ```sh
-git clone https://github.com/<you>/agterm-session-search
+git clone https://github.com/ilya-simonenko/agterm-session-search
 cd agterm-session-search
 ./install.sh                 # the search overlay on ctrl+opt+p
 ./install.sh --emoji-names   # plus the session-naming hook
