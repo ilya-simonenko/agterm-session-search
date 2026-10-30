@@ -2,7 +2,9 @@
 """Claude Code hook: name the agterm session "<emoji> <conversation title>" whenever Claude titles it.
 
 Register for SessionStart, Stop and SessionEnd. The hook returns at once and does the work detached.
-The emoji is picked by haiku once per title and cached. A session renamed by hand is left alone: the
+The emoji is picked by haiku once per conversation, from what the conversation turns out to be about: until
+Claude has said enough to show the subject (a bare "review PR 123" does not), the session carries the title
+alone. A session renamed by hand is left alone: the
 hook only renames a session whose name is still Claude's own title, the folder name, or the name it set
 itself. SessionEnd clears the name it set, so the sidebar goes back to following the terminal title.
 
@@ -15,6 +17,7 @@ import re
 import shutil
 import subprocess
 import sys
+import importlib.util
 import time
 
 HOME = os.path.expanduser("~")
@@ -31,12 +34,23 @@ DRY_RUN = os.environ.get("SESSION_EMOJI_DRY_RUN") == "1"
 CLEAN_ENV = {k: v for k, v in os.environ.items() if not k.startswith(("AGTERM_", "AGT_"))}
 SOCKET = ["--socket", os.environ["AGTERM_SOCKET"]] if os.environ.get("AGTERM_SOCKET") else []
 
-EMOJI_PROMPT = """Pick ONE emoji that best captures the theme of this coding session so it is recognisable
-at a glance in a list of terminal tabs. Prefer a concrete, specific emoji over generic ones like 💻 🔧 📝 ✅.
-Reply with the single emoji and nothing else.
+MIN_REPLY = 300  # characters of Claude's replies before the first pick
+REGROW = 600     # more reply text before asking again after a WAIT
+MAX_WAITS = 2    # then the model has to pick
+
+EMOJI_PROMPT = """Pick ONE emoji for this coding session so it is recognisable at a glance in a list of terminal
+tabs. Base it on the subject matter: the feature, system, component or domain the work touches, as the
+conversation below shows it. Never base it on the kind of activity, since reviews, pull requests, tickets,
+merges and investigations all look alike: avoid 🐙 ➡️ 🔀 👀 🔍 🔎 📋 💻 🔧 📝 ✅ and the like.
+{wait}Reply with the single emoji and nothing else.
 
 Title: {title}
-{summary}"""
+{summary}
+Conversation:
+{conversation}"""
+WAIT_RULE = """If the conversation does not show the subject yet (say, only a request to review PR 123 or to look
+at a ticket), reply WAIT instead.
+"""
 
 
 def load_json(path, default):
@@ -96,20 +110,43 @@ def latest_title(transcript):
     return title.strip()
 
 
-def pick_emoji(title, transcript):
-    cache = load_json(EMOJIS, {})
-    if title in cache:
-        return cache[title]
-    summary = load_json(SUMMARIES, {}).get(transcript, {}).get("summary", "")
-    prompt = EMOJI_PROMPT.format(title=title, summary=("Summary: " + summary) if summary else "")
+def search_module():
+    # installed next to this hook; its transcript parser is cached and shared with the search index
+    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "session-search.py")
+    spec = importlib.util.spec_from_file_location("session_search", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def ask(prompt):
     out = subprocess.run([CLAUDE, "-p", "--model", MODEL, "--no-session-persistence", "--tools", ""],
                          input=prompt, capture_output=True, text=True, timeout=60, cwd=CACHE, env=CLEAN_ENV)
     reply = out.stdout.strip().split()
-    emoji = reply[0] if out.returncode == 0 and reply else ""
-    # anything with letters or digits is the model talking, not an emoji
-    if not emoji or len(emoji) > 8 or re.search(r"[A-Za-z0-9]", emoji):
+    return reply[0] if out.returncode == 0 and reply else ""
+
+
+def pick_emoji(title, transcript, claude_sid, state):
+    """The conversation's emoji, or None while its subject is still unclear; waiting is recorded in state."""
+    cache = {k: v for k, v in load_json(EMOJIS, {}).items() if isinstance(v, dict)}
+    if claude_sid in cache:
+        return cache[claude_sid]["emoji"]
+    parsed = search_module().parse_transcript(transcript)
+    said = sum(len(r) for r in parsed["replies"])
+    waits = state.get("waits", 0)
+    if said < MIN_REPLY or (waits and said < state.get("asked_at", 0) + REGROW):
         return None
-    cache[title] = emoji
+    summary = load_json(SUMMARIES, {}).get(transcript, {}).get("summary", "")
+    first = parsed["prompts"][0][:1000] if parsed["prompts"] else ""
+    replies = "\n".join("CLAUDE: " + r for r in parsed["replies"])[-5000:]
+    emoji = ask(EMOJI_PROMPT.format(
+        wait=WAIT_RULE if waits < MAX_WAITS else "", title=title,
+        summary=("Summary: " + summary) if summary else "", conversation=f"USER: {first}\n{replies}"))
+    # anything with letters or digits is WAIT or the model talking, not an emoji
+    if not emoji or len(emoji) > 8 or re.search(r"[A-Za-z0-9]", emoji):
+        state.update(waits=waits + 1, asked_at=said)
+        return None
+    cache[claude_sid] = {"emoji": emoji, "title": title}
     save_json(EMOJIS, cache)
     return emoji
 
@@ -151,15 +188,18 @@ def run(event, sid, transcript, claude_sid):
     title = latest_title(transcript) if transcript and os.path.exists(transcript) else ""
     if not title:
         return
-    if state.get("title") == title and name == state.get("name"):
+    if state.get("title") == title and name == state.get("name") and state.get("emoji"):
         return
     if not owned(name, state, [title, state.get("title", "")], session.get("cwd") or ""):
         return
-    emoji = pick_emoji(title, transcript)
+    if state.get("claude") != claude_sid:
+        state = {"name": state["name"]} if "name" in state else {}
+    emoji = pick_emoji(title, transcript, claude_sid, state)
     new_name = f"{emoji} {title}" if emoji else title
     if new_name != name:
         rename(sid, new_name)
-    save_json(state_path, {"title": title, "name": new_name, "claude": claude_sid})
+    state.update(title=title, name=new_name, claude=claude_sid, emoji=emoji or "")
+    save_json(state_path, state)
 
 
 def main():
