@@ -40,6 +40,23 @@ class SessionSearchTests(unittest.TestCase):
             f.write('{"type":"user","message":{"content":"a later prompt"}}\n')
         self.assertIn("a later prompt", self.search.parse_transcript(self.transcript)["prompts"])
 
+    def test_parse_resumes_after_a_partly_written_line(self):
+        self.search.parse_transcript(self.transcript)
+        with open(self.transcript, "a") as f:
+            f.write('{"type":"user","message":{"content":"half')
+        self.assertNotIn("half written", self.search.parse_transcript(self.transcript)["prompts"])
+        with open(self.transcript, "a") as f:
+            f.write(' written"}}\n')
+        parsed = self.search.parse_transcript(self.transcript)
+        self.assertEqual(parsed["prompts"], ["why does the login test fail on CI?", "half written"])
+        self.assertEqual(parsed["title"], "Flaky login test investigation")
+
+    def test_parse_starts_over_when_the_file_shrinks(self):
+        self.search.parse_transcript(self.transcript)
+        with open(self.transcript, "w") as f:
+            f.write('{"type":"user","message":{"content":"fresh start"}}\n')
+        self.assertEqual(self.search.parse_transcript(self.transcript)["prompts"], ["fresh start"])
+
     def test_digest_keeps_the_newest_end(self):
         parsed = {"prompts": ["first", "second"], "replies": ["answer"]}
         self.assertEqual(self.search.digest(parsed, 14), "CLAUDE: answer")

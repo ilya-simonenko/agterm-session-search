@@ -120,36 +120,42 @@ def text_of(content):
 
 
 def parse_transcript(path):
-    """{title, prompts: [...], replies: [...]} from a transcript, cached by mtime and size."""
-    st = os.stat(path)
+    """{title, prompts: [...], replies: [...]} from a transcript. Transcripts only grow, so the cache resumes reading
+    where it stopped: a live 20MB conversation costs one turn's lines, not a full parse, on every open."""
+    size = os.path.getsize(path)
     key = re.sub(r"[^A-Za-z0-9]", "_", path)[-120:]
     cache_path = os.path.join(CACHE, "parsed", key + ".json")
-    cached = load_json(cache_path, None)
-    if cached and cached.get("stamp") == [st.st_mtime, st.st_size] and "cwd" in cached:
-        return cached
-    title, prompts, replies, cwd = "", [], [], ""
-    with open(path, errors="replace") as f:
-        for line in f:
-            try:
-                e = json.loads(line)
-            except ValueError:
-                continue
-            kind = e.get("type")
-            cwd = cwd or e.get("cwd") or ""
-            if kind == "ai-title":
-                title = e.get("aiTitle") or title
-            elif kind == "custom-title":
-                title = e.get("customTitle") or title
-            elif kind == "user" and not e.get("isMeta"):
-                t = text_of(e.get("message", {}).get("content")).strip()
-                # slash-command wrappers, hook output and interrupted-turn markers are not prompts
-                if t and not t.startswith("<") and not t.startswith("[Request interrupted"):
-                    prompts.append(t[:2000])
-            elif kind == "assistant":
-                t = text_of(e.get("message", {}).get("content")).strip()
-                if t:
-                    replies.append(t[:600])
-    parsed = {"stamp": [st.st_mtime, st.st_size], "title": title, "prompts": prompts, "replies": replies, "cwd": cwd}
+    parsed = load_json(cache_path, None)
+    if not parsed or "offset" not in parsed or parsed["offset"] > size:
+        parsed = {"offset": 0, "title": "", "prompts": [], "replies": [], "cwd": ""}
+    if parsed["offset"] == size:
+        return parsed
+    with open(path, "rb") as f:
+        f.seek(parsed["offset"])
+        chunk = f.read()
+    # a line still being written is left for the next read
+    end = chunk.rfind(b"\n") + 1
+    for line in chunk[:end].decode(errors="replace").splitlines():
+        try:
+            e = json.loads(line)
+        except ValueError:
+            continue
+        kind = e.get("type")
+        parsed["cwd"] = parsed["cwd"] or e.get("cwd") or ""
+        if kind == "ai-title":
+            parsed["title"] = e.get("aiTitle") or parsed["title"]
+        elif kind == "custom-title":
+            parsed["title"] = e.get("customTitle") or parsed["title"]
+        elif kind == "user" and not e.get("isMeta"):
+            t = text_of(e.get("message", {}).get("content")).strip()
+            # slash-command wrappers, hook output and interrupted-turn markers are not prompts
+            if t and not t.startswith("<") and not t.startswith("[Request interrupted"):
+                parsed["prompts"].append(t[:2000])
+        elif kind == "assistant":
+            t = text_of(e.get("message", {}).get("content")).strip()
+            if t:
+                parsed["replies"].append(t[:600])
+    parsed["offset"] += end
     os.makedirs(os.path.dirname(cache_path), exist_ok=True)
     save_json(cache_path, parsed)
     return parsed
