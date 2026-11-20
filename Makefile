@@ -6,7 +6,7 @@ test:
 
 lint:
 	shellcheck install.sh tests/test_install.sh
-	python3 -m py_compile bin/session-search.py bin/claude-emoji-name.py
+	python3 -m py_compile bin/session-search.py bin/claude-session-emoji.py bin/session-background.py
 
 install:
 	./install.sh

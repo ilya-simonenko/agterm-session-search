@@ -7,7 +7,8 @@ usage() {
 usage: install.sh [options]
 
   --chord CHORD       keymap chord for the search overlay (default: ctrl+opt+p)
-  --emoji-names       also register the Claude Code hook that names sessions "<emoji> <title>"
+  --emoji             also register the Claude Code hook that gives each session an emoji name and
+                      background (--emoji-names is the older spelling)
   --dest DIR          where the scripts go (default: ~/.config/agterm/scripts)
   --config-dir DIR    agterm config directory holding keymap.conf (default: ~/.config/agterm)
   --link              symlink the scripts instead of copying them (for working on this repo)
@@ -25,7 +26,7 @@ DEST=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --chord) CHORD="$2"; shift ;;
-        --emoji-names) EMOJI=1 ;;
+        --emoji|--emoji-names) EMOJI=1 ;;
         --dest) DEST="$2"; shift ;;
         --config-dir) CONFIG_DIR="$2"; shift ;;
         --link) LINK=1 ;;
@@ -41,10 +42,11 @@ DEST="${DEST:-$CONFIG_DIR/scripts}"
 REPO="$(cd "$(dirname "$0")" && pwd)"
 KEYMAP="$CONFIG_DIR/keymap.conf"
 CLAUDE_SETTINGS="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json"
-HOOK_CMD="$DEST/claude-emoji-name.py"
+HOOK_CMD="$DEST/claude-session-emoji.py"
 BEGIN="# >>> agterm-session-search >>>"
 END="# <<< agterm-session-search <<<"
-FILES=(session-search.py session-search.html claude-emoji-name.py)
+FILES=(session-search.py session-search.html claude-session-emoji.py session-background.py)
+OLD_FILES=(claude-emoji-name.py)  # earlier names, removed on install and uninstall
 
 need() { command -v "$1" >/dev/null || { echo "missing dependency: $1" >&2; exit 1; }; }
 need python3
@@ -63,7 +65,7 @@ edit_hooks() {
     need jq
     cp "$CLAUDE_SETTINGS" "$CLAUDE_SETTINGS.bak-session-search"
     jq --arg cmd "$HOOK_CMD" --argjson add "$add" '
-        def ours: (.command // "") | endswith("claude-emoji-name.py");
+        def ours: (.command // "") | (endswith("claude-session-emoji.py") or endswith("claude-emoji-name.py"));
         .hooks = ((.hooks // {})
             | with_entries(.value |= (map(.hooks |= map(select(ours | not))) | map(select(.hooks | length > 0)))))
         | if $add == 1 then
@@ -78,18 +80,19 @@ edit_hooks() {
 if [ "$UNINSTALL" = 1 ]; then
     strip_keymap
     edit_hooks 0
-    for f in "${FILES[@]}"; do rm -f "$DEST/$f"; done
+    for f in "${FILES[@]}" "${OLD_FILES[@]}"; do rm -f "$DEST/$f"; done
     [ "$PURGE" = 1 ] && rm -rf "$HOME/.cache/agterm-session-search"
     echo "removed. Reload the keymap (File > Reload Keymap) and restart running Claude Code sessions."
     exit 0
 fi
 
 mkdir -p "$DEST" "$CONFIG_DIR"
+for f in "${OLD_FILES[@]}"; do rm -f "$DEST/$f"; done
 for f in "${FILES[@]}"; do
     rm -f "$DEST/$f"
     if [ "$LINK" = 1 ]; then ln -s "$REPO/bin/$f" "$DEST/$f"; else cp "$REPO/bin/$f" "$DEST/$f"; fi
 done
-chmod +x "$DEST/session-search.py" "$DEST/claude-emoji-name.py"
+chmod +x "$DEST/session-search.py" "$DEST/claude-session-emoji.py" "$DEST/session-background.py"
 
 strip_keymap
 {
@@ -103,5 +106,9 @@ edit_hooks "$EMOJI"
 
 echo "installed to $DEST"
 echo "next: File > Reload Keymap in agterm, then press $CHORD."
-[ "$EMOJI" = 1 ] && echo "emoji names: restart running Claude Code sessions (or run /hooks) to pick up the hook."
+if [ "$EMOJI" = 1 ]; then
+    echo "emoji sessions: restart running Claude Code sessions (or run /hooks) to pick up the hook."
+    python3 -c 'import PIL' 2>/dev/null \
+        || echo "emoji sessions: no Pillow for $(command -v python3), so names only; 'python3 -m pip install --user Pillow' adds backgrounds."
+fi
 exit 0

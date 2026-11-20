@@ -3,6 +3,7 @@ import json
 import os
 import shutil
 import tempfile
+import time
 import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -63,12 +64,17 @@ class SessionSearchTests(unittest.TestCase):
         self.assertIn("USER: first", self.search.digest(parsed, 1000))
 
 
-class EmojiNameTests(unittest.TestCase):
+class SessionEmojiTests(unittest.TestCase):
     def setUp(self):
-        self.names = load("claude-emoji-name")
+        self.names = load("claude-session-emoji")
         self.tmp = tempfile.mkdtemp()
         self.names.EMOJIS = os.path.join(self.tmp, "emojis.json")
         self.names.SUMMARIES = os.path.join(self.tmp, "summaries.json")
+        self.names.BG_DIR = os.path.join(self.tmp, "backgrounds")
+        self.names.BACKGROUNDS = True
+        self.calls = []
+        self.names.ctl = lambda *args: self.calls.append(args) or ""
+        self.names.render_background = lambda path, emoji, title: open(path, "w").close() or True
         search = load("session-search")
         search.CACHE = self.tmp
         self.names.search_module = lambda: search
@@ -98,7 +104,6 @@ class EmojiNameTests(unittest.TestCase):
     def test_owned_refuses_a_manual_rename(self):
         self.assertFalse(self.names.owned("my api work", {"name": "🚦 old"}, ["Flaky login"], "/x/repo"))
 
-
     def test_pick_waits_for_replies_before_asking(self):
         self.assertIsNone(self.names.pick_emoji("Review PR 412", self.transcript, "c1", {}))
         self.assertEqual(self.prompts, [])
@@ -124,6 +129,93 @@ class EmojiNameTests(unittest.TestCase):
         self.assertEqual(self.names.pick_emoji("Review PR 412", self.transcript, "c1", {}), "🍪")
         self.assertEqual(self.names.pick_emoji("Login cookie race", self.transcript, "c1", {}), "🍪")
         self.assertEqual(len(self.prompts), 1)
+
+    def test_settle_waits_for_a_late_write(self):
+        import threading
+        def late():
+            time.sleep(0.4)
+            self.say(500)
+        threading.Thread(target=late).start()
+        start = time.time()
+        self.names.settle(self.transcript, quiet=0.6, limit=5, poll=0.05)
+        self.assertGreater(time.time() - start, 0.9)
+        self.assertGreaterEqual(sum(map(len, self.names.search_module().parse_transcript(self.transcript)["replies"])), 500)
+
+    def test_settle_gives_up_on_a_file_that_keeps_growing(self):
+        import threading
+        stop = threading.Event()
+        def grow():
+            while not stop.is_set():
+                self.say(1)
+                time.sleep(0.05)
+        threading.Thread(target=grow).start()
+        start = time.time()
+        self.names.settle(self.transcript, quiet=0.5, limit=0.8, poll=0.05)
+        stop.set()
+        self.assertLess(time.time() - start, 1.2)
+
+    def test_background_waits_for_the_emoji(self):
+        state = {}
+        self.names.set_background("s1", {}, state, "c1", "", "Review PR 412")
+        self.assertEqual((self.calls, state), ([], {}))
+
+    def test_background_is_set_once_per_emoji_and_title(self):
+        state = {}
+        self.names.set_background("s1", {}, state, "c1", "🍪", "Login cookie race")
+        path = state["background"]
+        self.assertTrue(path.startswith(self.names.BG_DIR))
+        self.assertEqual(self.calls[0][:4], ("session", "background", "image", path))
+        self.names.set_background("s1", {"background": {"imagePath": path}}, state, "c1", "🍪", "Login cookie race")
+        self.assertEqual(len(self.calls), 1)
+        self.names.set_background("s1", {"background": {"imagePath": path}}, state, "c1", "🍪", "Cookie race fix")
+        self.assertEqual(len(self.calls), 2)
+        self.assertNotEqual(state["background"], path)
+
+    def test_background_set_by_someone_else_is_kept(self):
+        state = {}
+        self.names.set_background("s1", {"background": {"imagePath": "/elsewhere/bg.png"}}, state, "c1", "🍪", "t")
+        self.names.set_background("s1", {"background": {"kind": "color"}}, state, "c1", "🍪", "t")
+        self.assertEqual((self.calls, state), ([], {}))
+
+    def test_a_new_background_style_replaces_the_shown_one(self):
+        self.names.STATE_DIR = os.path.join(self.tmp, "names")
+        self.names.SEEN = os.path.join(self.tmp, "seen.json")
+        with open(self.names.EMOJIS, "w") as f:
+            json.dump({"c1": {"emoji": "🍪", "title": "t"}}, f)
+        session = {"name": "", "cwd": "/x/repo"}
+        self.names.current_session = lambda sid: session
+        self.names.run("Stop", "s1", self.transcript, "c1")
+        session["name"] = "🍪 Flaky login test investigation"
+        session["background"] = {"imagePath": self.calls[-1][3]}
+        before = len(self.calls)
+        self.names.run("Stop", "s1", self.transcript, "c1")
+        self.assertEqual(len(self.calls), before)
+        self.names.BG_STYLE += 1
+        self.names.run("Stop", "s1", self.transcript, "c1")
+        self.assertEqual(self.calls[-1][:3], ("session", "background", "image"))
+        self.assertNotEqual(self.calls[-1][3], session["background"]["imagePath"])
+
+    def test_background_skipped_when_it_cannot_render(self):
+        self.names.render_background = lambda path, emoji, title: False
+        state = {}
+        self.names.set_background("s1", {}, state, "c1", "🍪", "t")
+        self.assertEqual((self.calls, state), ([], {}))
+
+
+@unittest.skipUnless(importlib.util.find_spec("PIL") and os.path.exists("/System/Library/Fonts/Apple Color Emoji.ttc"),
+                     "needs Pillow and the macOS emoji font")
+class SessionBackgroundTests(unittest.TestCase):
+    def test_renders_a_dark_frame_of_the_screen_size(self):
+        bg = load("session-background")
+        img = bg.render("🍪", "Login cookie race " * 10)
+        self.assertEqual(img.size, (bg.WIDTH, bg.HEIGHT))
+        self.assertLess(img.convert("L").resize((1, 1)).getpixel((0, 0)), 80)  # mean brightness
+
+    def test_a_tall_emoji_fits_the_frame(self):
+        bg = load("session-background")
+        glyph = bg.emoji_image("🛡️")
+        self.assertGreater(glyph.height, glyph.width)
+        bg.render("🛡️")
 
 
 if __name__ == "__main__":

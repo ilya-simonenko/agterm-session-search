@@ -5,8 +5,9 @@ conversation summaries, prompts and scrollback, including recently closed sessio
 conversations. One chord opens a search overlay; Return jumps to the session, reopens it, or resumes the
 conversation.
 
-An optional Claude Code hook also names each session after its conversation, with an emoji picked to match
-the topic: `🧪 Flaky login test investigation`.
+An optional Claude Code hook also gives each session an emoji picked to match the conversation's topic, as
+its name (`🧪 Flaky login test investigation`) and as its background, so you can tell sessions apart at a
+glance.
 
 ![Searching "migration": an open session matched by name and another by its scrollback, then a recently closed session and a past Claude conversation matched by their summaries](docs/search-query.png)
 
@@ -45,9 +46,11 @@ summarized for the next search. Until then it is still found by its title and it
 
 - macOS and agterm 0.38.1 or later, for the page bridge (`agterm.request`) the overlay drives the app with
 - Python 3.9 or later; macOS ships one as `/usr/bin/python3`
-- Claude Code, for summaries and emoji names; the search works without it, over names, context and
+- Claude Code, for summaries and emoji sessions; the search works without it, over names, context and
   scrollback
-- `jq`, only for `--emoji-names` and `--uninstall`, which edit Claude Code's `settings.json`
+- `jq`, only for `--emoji` and `--uninstall`, which edit Claude Code's `settings.json`
+- [Pillow](https://pypi.org/project/pillow/), only for emoji backgrounds (`python3 -m pip install --user Pillow`);
+  without it the hook sets names only
 
 ## Install
 
@@ -55,20 +58,20 @@ summarized for the next search. Until then it is still found by its title and it
 git clone https://github.com/ilya-simonenko/agterm-session-search
 cd agterm-session-search
 ./install.sh                 # the search overlay on ctrl+opt+p
-./install.sh --emoji-names   # plus the session-naming hook
+./install.sh --emoji         # plus the emoji name and background hook
 ```
 
 Then run File ▸ Reload Keymap (or `agtermctl keymap reload`) and press ⌃⌥P.
 
-The installer copies three files to `~/.config/agterm/scripts`, adds one marked block to
-`~/.config/agterm/keymap.conf`, and with `--emoji-names` adds one hook to Claude Code's SessionStart, Stop
+The installer copies four files to `~/.config/agterm/scripts`, adds one marked block to
+`~/.config/agterm/keymap.conf`, and with `--emoji` adds one hook to Claude Code's SessionStart, Stop
 and SessionEnd. Re-running it replaces its own earlier edits, so it is also how you upgrade or change an
 option. It backs up `settings.json` to `settings.json.bak-session-search` before each edit.
 
 | Option | Effect |
 | --- | --- |
 | `--chord CHORD` | another chord, e.g. `ctrl+p` (first move the built-in switcher with a keymap line such as `map ctrl+opt+p session_palette`) |
-| `--emoji-names` | register the session-naming hook; a later run without it removes the hook |
+| `--emoji` | register the emoji name and background hook (`--emoji-names` still works); a later run without it removes the hook |
 | `--config-dir DIR` | your agterm config directory, if you moved it in Settings |
 | `--dest DIR` | where the scripts go |
 | `--link` | symlink the scripts to this checkout instead of copying them |
@@ -76,18 +79,23 @@ option. It backs up `settings.json` to `settings.json.bak-session-search` before
 
 Running Claude Code sessions pick up a hook change after `/hooks` or a restart.
 
-## Emoji session names
+## Emoji sessions
 
-With `--emoji-names`, whenever Claude Code titles a conversation or changes its title, the session it runs
-in is renamed to `<emoji> <title>`. Haiku picks the emoji once per conversation, from its subject rather than
+With `--emoji`, whenever Claude Code titles a conversation or changes its title, the session it runs
+in is renamed to `<emoji> <title>` and given a background showing that emoji large and faint, with the title
+in faint type below it, over a dark wash in the emoji's own colours. Haiku picks the emoji once per conversation, from its subject rather than
 its activity, so five PR reviews do not all become 🐙. Until Claude has said enough to show the subject (a bare
 "review PR 412" does not), the session carries the title alone; the model may ask to wait twice before it has to
-pick. Picks are kept in `~/.cache/agterm-session-search/emojis.json` by conversation id, which you can edit to
-override one.
+pick. The background waits for the emoji too. Picks are kept in `~/.cache/agterm-session-search/emojis.json`
+by conversation id, which you can edit to override one.
 
 - A session you renamed by hand is never touched. The hook only replaces Claude's own title, the
   directory name, or a name it set itself.
-- When Claude Code exits, the name is cleared, so the session goes back to following its terminal title.
+- A background set by anything else (Settings, `agtermctl session background`, another hook) is never
+  replaced.
+- When Claude Code exits, the name and background are cleared, so the session goes back to following its
+  terminal title.
+- `session-background.py out.png 🧪 "Some title"` renders a background without applying it, to preview one.
 - A renamed session no longer shows Claude Code's own status glyph in its name; agterm's status dot still
   shows whether it is working.
 
@@ -101,6 +109,8 @@ Environment variables, set in the keymap line or your shell profile:
 | `SESSION_SEARCH_MODEL` | `haiku` | the summary model |
 | `SESSION_SEARCH_DAYS` | `30` | how far back past conversations go |
 | `SESSION_EMOJI_MODEL` | `haiku` | the emoji model |
+| `SESSION_EMOJI_BACKGROUND` | `1` | `0` sets names only, no backgrounds |
+| `SESSION_EMOJI_BG_OPACITY` | `0.55` | how strongly the background shows |
 | `CLAUDE_DIRS` | `~/.claude` | Claude Code config directories to read, space separated |
 
 `session-search.py --dump` prints the index as JSON without opening anything, which is the quickest way to
