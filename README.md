@@ -83,10 +83,14 @@ Running Claude Code sessions pick up a hook change after `/hooks` or a restart.
 
 With `--emoji`, whenever Claude Code titles a conversation or changes its title, the session it runs
 in is renamed to `<emoji> <title>` and given a background showing that emoji large and faint, with the title
-in faint type below it, over a dark wash in the emoji's own colours. Haiku picks the emoji once per conversation, from its subject rather than
-its activity, so five PR reviews do not all become 🐙. Until Claude has said enough to show the subject (a bare
-"review PR 412" does not), the session carries the title alone; the model may ask to wait twice before it has to
-pick. The background waits for the emoji too. Picks are kept in `~/.cache/agterm-session-search/emojis.json`
+in faint type below it, over a dark wash in the emoji's own colours.
+
+Haiku picks the emoji once per conversation, when its first turn is done, from what that turn shows: the
+ticket, pull request, code or docs Claude read and what it replied, not the wording of the request. It is told
+the repository name, so a repository where every session runs does not hand them all the same emoji, and it
+sees the recent picks, so it reuses one only for the same subject. Five PR reviews do not all become 🐙. If the
+first turn does not show the subject yet, the model may ask to wait twice, as Claude says more, before it has
+to pick; until then the session carries the title alone. The background waits for the emoji too. Picks are kept in `~/.cache/agterm-session-search/emojis.json`
 by conversation id, which you can edit to override one.
 
 - A session you renamed by hand is never touched. The hook only replaces Claude's own title, the

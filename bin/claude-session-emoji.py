@@ -3,9 +3,9 @@
 its background (the emoji large and faint, the title below it).
 
 Register for SessionStart, Stop and SessionEnd. The hook returns at once and does the work detached.
-The emoji is picked by haiku once per conversation, from what the conversation turns out to be about: until
-Claude has said enough to show the subject (a bare "review PR 123" does not), the session carries the title
-alone and no background. A session renamed by hand is left alone: the hook only renames a session whose name
+The emoji is picked by haiku once per conversation, once its first turn is done, from what that turn shows the
+work is about: the ticket, pull request, code or docs Claude read, not the wording of the request. Until then, or
+while the model says the subject is still unclear, the session carries the title alone and no background. A session renamed by hand is left alone: the hook only renames a session whose name
 is still Claude's own title, the folder name, or the name it set itself. Likewise a background set by anything
 else is never replaced. SessionEnd clears the name and background it set, so the session looks as before.
 
@@ -44,20 +44,33 @@ DRY_RUN = os.environ.get("SESSION_EMOJI_DRY_RUN") == "1"
 CLEAN_ENV = {k: v for k, v in os.environ.items() if not k.startswith(("AGTERM_", "AGT_"))}
 SOCKET = ["--socket", os.environ["AGTERM_SOCKET"]] if os.environ.get("AGTERM_SOCKET") else []
 
-MIN_REPLY = 300  # characters of Claude's replies before the first pick
 REGROW = 600     # more reply text before asking again after a WAIT
+TURN_BUDGET = 8000  # characters of the first turn shown to the model
+READ_EXCERPT = 900  # of each thing Claude read in it
 MAX_WAITS = 2    # then the model has to pick
 
 EMOJI_PROMPT = """Pick ONE emoji for this coding session so it is recognisable at a glance in a list of terminal
-tabs. Base it on the subject matter: the feature, system, component or domain the work touches, as the
-conversation below shows it. Never base it on the kind of activity, since reviews, pull requests, tickets,
+tabs. Base it on what the work is actually about, as the first turn below shows it: the content Claude read
+there (the ticket, the pull request, the code, the docs) and what it found, rather than the wording of the request,
+which is often just "review PR 123" or a ticket id. Never base it on the kind of activity, since reviews, pull requests, tickets,
 merges and investigations all look alike: avoid 🐙 ➡️ 🔀 👀 🔍 🔎 📋 💻 🔧 📝 ✅ and the like.
-{wait}Reply with the single emoji and nothing else.
+{repo}{taken}{wait}Reply with the single emoji and nothing else.
 
 Title: {title}
 {summary}
-Conversation:
+First turn:
 {conversation}"""
+REPO_RULE = """The work happens in the {repo} repository, where most sessions run, so the repository, its product
+and the business domain it serves are shared by them all and tell nothing apart. Never pick an emoji for the
+repository's name or domain (a coin for a crypto repository, a whale for a Docker one, a chart for a trading one),
+even when the conversation mentions it a lot: pick for the specific feature, system or problem inside it.
+"""
+TAKEN_RULE = """Emojis other recent sessions already have, with their titles:
+{taken}
+Pick one not in this list, unless this conversation is about the very same subject as that session.
+"""
+RECENT = 40  # recent picks shown to the model so it spreads them out
+
 WAIT_RULE = """If the conversation does not show the subject yet (say, only a request to review PR 123 or to look
 at a ticket), reply WAIT instead.
 """
@@ -185,22 +198,75 @@ def ask(prompt):
     return reply[0] if out.returncode == 0 and reply else ""
 
 
+def first_turn(transcript):
+    """The first turn as text: the prompt, what Claude read (tool results, labelled by the call that fetched them)
+    and what it replied, within TURN_BUDGET. Empty until Claude has replied; reading stops at the first prompt
+    after that reply, so prompts sent before it (a retry after an interruption) all belong to the turn."""
+    text_of = search_module().text_of
+    prompt, reads, replies, calls = "", [], [], {}
+    with open(transcript, errors="replace") as f:
+        for line in f:
+            try:
+                e = json.loads(line)
+            except ValueError:
+                continue
+            content = (e.get("message") or {}).get("content")
+            if e.get("type") == "user" and not e.get("isMeta"):
+                t = text_of(content).strip()
+                # slash-command wrappers, interruptions and skill text Claude Code injects are not prompts
+                if t and not t.startswith(("<", "[Request interrupted", "Base directory for this skill")):
+                    if replies:
+                        break  # a prompt after Claude replied: the first turn is over
+                    if t[:1500] not in prompt:  # a prompt sent again after an interruption counts once
+                        prompt = (prompt + "\nUSER: " if prompt else "") + t[:1500]
+                for b in content if isinstance(content, list) else []:
+                    if isinstance(b, dict) and b.get("type") == "tool_result" and not b.get("is_error"):
+                        r = text_of(b.get("content")).strip()
+                        if len(r) > 40:
+                            reads.append(f"[{calls.get(b.get('tool_use_id'), 'tool')}]\n{r[:READ_EXCERPT]}")
+            elif e.get("type") == "assistant" and prompt and isinstance(content, list):
+                for b in content:
+                    if not isinstance(b, dict):
+                        continue
+                    if b.get("type") == "tool_use":
+                        calls[b.get("id")] = f"{b.get('name')} {json.dumps(b.get('input'), ensure_ascii=False)[:160]}"
+                    elif b.get("type") == "text" and b.get("text", "").strip():
+                        replies.append(b["text"].strip()[:1500])
+    if not prompt or not replies:
+        return ""
+    head = "USER: " + prompt
+    tail = "\n".join("CLAUDE: " + r for r in replies)[-3000:]
+    room = TURN_BUDGET - len(head) - len(tail)
+    read = ""
+    for r in reads:  # in the order Claude read them: the ticket or PR usually comes first
+        if len(read) + len(r) > room:
+            break
+        read += "\nCLAUDE READ " + r
+    return f"{head}{read}\n{tail}"
+
+
 def pick_emoji(title, transcript, claude_sid, state):
     """The conversation's emoji, or None while its subject is still unclear; waiting is recorded in state."""
     cache = {k: v for k, v in load_json(EMOJIS, {}).items() if isinstance(v, dict)}
     if claude_sid in cache:
         return cache[claude_sid]["emoji"]
+    turn = first_turn(transcript)
+    if not turn:
+        return None
     parsed = search_module().parse_transcript(transcript)
     said = sum(len(r) for r in parsed["replies"])
     waits = state.get("waits", 0)
-    if said < MIN_REPLY or (waits and said < state.get("asked_at", 0) + REGROW):
+    if waits and said < state.get("asked_at", 0) + REGROW:
         return None
+    if waits:  # the first turn did not show the subject: add what Claude has said since
+        turn += "\n\nLater replies:\n" + "\n".join("CLAUDE: " + r for r in parsed["replies"])[-2500:]
     summary = load_json(SUMMARIES, {}).get(transcript, {}).get("summary", "")
-    first = parsed["prompts"][0][:1000] if parsed["prompts"] else ""
-    replies = "\n".join("CLAUDE: " + r for r in parsed["replies"])[-5000:]
+    repo = os.path.basename((parsed.get("cwd") or "").rstrip("/"))
+    taken = "\n".join(f"{v['emoji']} {v['title']}" for v in list(cache.values())[-RECENT:])
     emoji = ask(EMOJI_PROMPT.format(
+        repo=REPO_RULE.format(repo=repo) if repo else "", taken=TAKEN_RULE.format(taken=taken) if taken else "",
         wait=WAIT_RULE if waits < MAX_WAITS else "", title=title,
-        summary=("Summary: " + summary) if summary else "", conversation=f"USER: {first}\n{replies}"))
+        summary=("Summary: " + summary) if summary else "", conversation=turn))
     # anything with letters or digits is WAIT or the model talking, not an emoji
     if not emoji or len(emoji) > 8 or re.search(r"[A-Za-z0-9]", emoji):
         state.update(waits=waits + 1, asked_at=said)

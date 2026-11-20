@@ -104,9 +104,54 @@ class SessionEmojiTests(unittest.TestCase):
     def test_owned_refuses_a_manual_rename(self):
         self.assertFalse(self.names.owned("my api work", {"name": "🚦 old"}, ["Flaky login"], "/x/repo"))
 
-    def test_pick_waits_for_replies_before_asking(self):
+    def write(self, *entries):
+        with open(self.transcript, "w") as f:
+            for e in entries:
+                f.write(json.dumps(e) + "\n")
+
+    def test_pick_waits_for_the_first_reply_before_asking(self):
+        self.write({"type": "user", "message": {"content": "review PR 412"}},
+                   {"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "t1", "name": "Bash",
+                                                                   "input": {"command": "gh pr view 412"}}]}})
         self.assertIsNone(self.names.pick_emoji("Review PR 412", self.transcript, "c1", {}))
         self.assertEqual(self.prompts, [])
+
+    def test_first_turn_shows_what_claude_read_and_stops_at_the_next_prompt(self):
+        self.write({"type": "user", "message": {"content": "review PR 412"}},
+                   {"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "t1", "name": "Bash",
+                                                                   "input": {"command": "gh pr view 412"}}]}},
+                   {"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "t1",
+                                                             "content": "Add a cookie jar to the login client " * 3}]}},
+                   {"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "t2",
+                                                             "is_error": True, "content": "x" * 100}]}},
+                   {"type": "assistant", "message": {"content": [{"type": "text", "text": "Looks fine."}]}},
+                   {"type": "user", "message": {"content": "now check the deploy"}},
+                   {"type": "assistant", "message": {"content": [{"type": "text", "text": "Deploy is green."}]}})
+        turn = self.names.first_turn(self.transcript)
+        self.assertTrue(turn.startswith("USER: review PR 412"))
+        self.assertIn('CLAUDE READ [Bash {"command": "gh pr view 412"}]\nAdd a cookie jar', turn)
+        self.assertIn("CLAUDE: Looks fine.", turn)
+        self.assertNotIn("xxxx", turn)
+        self.assertNotIn("deploy", turn)
+
+    def test_first_turn_spans_a_resent_prompt_and_injected_skill_text(self):
+        self.write({"type": "user", "message": {"content": "review PR 412"}},
+                   {"type": "user", "message": {"content": [{"type": "text", "text": "[Request interrupted by user]"}]}},
+                   {"type": "user", "message": {"content": "review PR 412"}},
+                   {"type": "user", "message": {"content": [{"type": "text", "text": "Base directory for this skill: /x"}]}},
+                   {"type": "assistant", "message": {"content": [{"type": "text", "text": "Looks fine."}]}})
+        turn = self.names.first_turn(self.transcript)
+        self.assertEqual(turn, "USER: review PR 412\nCLAUDE: Looks fine.")
+
+    def test_first_turn_keeps_the_reply_when_reads_overflow(self):
+        self.names.TURN_BUDGET = 2000
+        reads = [{"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": f"t{i}",
+                                                           "content": "y" * 5000}]}} for i in range(10)]
+        self.write({"type": "user", "message": {"content": "review PR 412"}}, *reads,
+                   {"type": "assistant", "message": {"content": [{"type": "text", "text": "Looks fine."}]}})
+        turn = self.names.first_turn(self.transcript)
+        self.assertLessEqual(len(turn), 2000)
+        self.assertTrue(turn.endswith("CLAUDE: Looks fine."))
 
     def test_pick_waits_while_the_model_says_wait_then_forces_a_pick(self):
         state = {}
@@ -122,6 +167,15 @@ class SessionEmojiTests(unittest.TestCase):
         self.assertIn("reply WAIT", self.prompts[0])
         self.assertNotIn("reply WAIT", self.prompts[-1])
         self.assertIn("redirect sets it", self.prompts[-1])
+
+    def test_pick_sees_the_repo_and_the_emojis_already_taken(self):
+        with open(self.names.EMOJIS, "w") as f:
+            json.dump({"c0": {"emoji": "🪙", "title": "Order book replay"}}, f)
+        self.say(400)
+        self.replies = ["🍪"]
+        self.assertEqual(self.names.pick_emoji("Login cookie race", self.transcript, "c1", {}), "🍪")
+        self.assertIn("the project repository", self.prompts[0])
+        self.assertIn("🪙 Order book replay", self.prompts[0])
 
     def test_pick_is_kept_per_conversation_across_retitles(self):
         self.say(400)
