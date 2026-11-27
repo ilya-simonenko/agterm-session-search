@@ -64,6 +64,52 @@ class SessionSearchTests(unittest.TestCase):
         self.assertIn("USER: first", self.search.digest(parsed, 1000))
 
 
+class AskTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.search = load("session-search")
+        self.search.CACHE = self.tmp
+        self.search.scrollback = lambda sessions: {"S1": "$ make migrate\nApplying 0042_split_line_items OK"}
+        self.prompt = os.path.join(self.tmp, "prompt.txt")
+        fake = os.path.join(self.tmp, "claude")
+        with open(fake, "w") as f:
+            f.write(f'#!/bin/sh\ncat > {self.prompt}\necho \'{{"picks": [{{"n": 1, "why": "the login cookie race"}}, {{"n": 9}}]}}\'\n')
+        os.chmod(fake, 0o755)
+        self.search.CLAUDE = fake
+        self.transcript = os.path.join(self.tmp, "conversation.jsonl")
+        shutil.copy(FIXTURE, self.transcript)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp)
+
+    def session(self, sid, name, path=None):
+        claude = [{"path": path, "title": "Flaky login test investigation", "summary": "Fixes a cookie race."}] if path else []
+        return {"kind": "open", "id": sid, "name": name, "context": "", "cwd": "/tmp/project", "status": "", "claude": claude}
+
+    def test_terms_drop_stopwords_and_short_words(self):
+        self.assertEqual(self.search.terms_of("Where did we fix the login.test on CI #412?"),
+                         ["fix", "login.test", "412"])
+
+    def test_excerpts_prefer_the_window_naming_most_terms(self):
+        texts = ["cookie mentioned alone " + "x " * 400 + "the redirect sets the cookie late"]
+        self.assertIn("redirect sets the cookie", self.search.excerpts(texts, ["cookie", "redirect"])[0])
+
+    def test_ask_sends_index_and_full_transcript_excerpts_and_keeps_valid_picks(self):
+        sessions = [self.session("S1", "orders"), self.session("S2", "login", self.transcript)]
+        answer = self.search.ask("where did the redirect break the cookie", sessions)
+        self.assertEqual(answer, {"picks": [{"i": 1, "why": "the login cookie race"}]})
+        with open(self.prompt) as f:
+            prompt = f.read()
+        self.assertIn("#1 [open, idle] login | /tmp/project | Flaky login test investigation | Fixes a cookie race.", prompt)
+        self.assertIn("#1:\n  - The test reads the cookie before the redirect sets it.", prompt)
+        self.assertNotIn("#0:", prompt)
+
+    def test_ask_reports_an_answer_without_json(self):
+        with open(self.search.CLAUDE, "w") as f:
+            f.write("#!/bin/sh\necho I could not decide\n")
+        self.assertEqual(self.search.ask("cookie", [self.session("S1", "a")]), {"error": "I could not decide"})
+
+
 class SessionEmojiTests(unittest.TestCase):
     def setUp(self):
         self.names = load("claude-session-emoji")

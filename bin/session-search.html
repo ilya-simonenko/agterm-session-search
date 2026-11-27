@@ -41,6 +41,11 @@
     opacity: .6; }
   .divider { margin: 12px 10px 4px; padding-top: 8px; font-size: 10px; text-transform: uppercase; letter-spacing: .06em;
     opacity: .45; border-top: 1px dashed color-mix(in srgb, var(--fg) 40%, transparent); }
+  #ask { padding: 7px 10px; border-radius: 7px; opacity: .75; }
+  #ask.sel { background: color-mix(in srgb, var(--accent) 22%, transparent); opacity: 1; }
+  #ask kbd { font: inherit; opacity: .6; margin-right: 6px; }
+  .why { font-size: 12px; margin-top: 2px; color: var(--accent); }
+  .notice { padding: 6px 10px; opacity: .6; }
 </style>
 </head>
 <body>
@@ -49,6 +54,8 @@
 <div id="list"></div>
 <script type="module">
 const SESSIONS = /*SESSIONS*/[];
+// haiku's answer to a query this page asked before it was reopened: {query, picks: [{i, why}]} or {query, error}
+const ASK = /*ASK*/null;
 // field -> weight; a term matching a heavier field ranks the session higher
 const FIELDS = [['name', 10], ['context', 9], ['title', 8], ['summary', 6], ['workspace', 4], ['cwd', 3],
   ['prompts', 2], ['scroll', 1]];
@@ -60,11 +67,12 @@ const GUESSED = new Set(['title', 'summary', 'prompts']), GUESSED_WEIGHT = 0.4;
 const LINE_VISIBLE = 150;
 const SCROLL_LINES = 400;
 // closed results always come after every open session, whatever their score
-const GROUP = {open: 0, recent: 1, conversation: 2};
+const GROUP = {ai: -1, open: 0, recent: 1, conversation: 2};
 const DIVIDER = {recent: 'Recently closed', conversation: 'Past Claude conversations'};
 
 const $q = document.getElementById('q'), $list = document.getElementById('list'), $meta = document.getElementById('meta');
-let results = [], sel = 0, scrollLoaded = 0;
+// sel -1 is the ask row: Return on a typed query asks haiku unless a row was picked with the arrows
+let results = [], sel = 0, scrollLoaded = 0, asking = false;
 
 for (const s of SESSIONS) {
   const exact = s.claude.filter(c => c.exact), convs = exact.length ? exact : s.claude;
@@ -103,8 +111,11 @@ function snippets(s, terms, visible) {
   return out;
 }
 
+const queryTerms = () => $q.value.toLowerCase().split(/\s+/).filter(Boolean);
+const answered = () => ASK && $q.value.trim() === ASK.query;
+
 function search() {
-  const terms = $q.value.toLowerCase().split(/\s+/).filter(Boolean);
+  const terms = queryTerms();
   results = [];
   for (const s of SESSIONS) {
     let score = 0, ok = true;
@@ -125,15 +136,31 @@ function search() {
   const byGroup = (a, b) => GROUP[a.s.kind] - GROUP[b.s.kind];
   if (terms.length) results.sort((a, b) => byGroup(a, b) || b.score - a.score);
   else results.sort((a, b) => byGroup(a, b) || (a.s.kind === 'open' ? a.s.active - b.s.active : b.s.closedAt - a.s.closedAt));
-  sel = 0;
+  if (answered() && ASK.picks) {
+    const picked = ASK.picks.map(p => ({s: SESSIONS[p.i], why: p.why, ai: true})).filter(r => r.s);
+    results = picked.concat(results.filter(r => !picked.some(p => p.s === r.s)));
+  }
+  sel = terms.length && !(answered() && ASK.picks?.length) ? -1 : 0;
   render(terms);
 }
 
-function render(terms) {
-  if (!results.length) { $list.innerHTML = '<div id="empty">No matching session</div>'; return; }
+function render(shown) {
+  const query = $q.value.trim();
+  let top = '';
+  if (asking) top = `<div class="notice">Asking haiku…</div>`;
+  else if (query) top = `<div id="ask"${sel === -1 ? ' class="sel"' : ''}><kbd>↵</kbd>${answered() ? 'Ask haiku again' : 'Ask haiku'}`
+    + ` to find “${esc(query)}” in full conversations and scrollback</div>`;
+  if (answered() && ASK.error) top += `<div class="notice">haiku failed: ${esc(ASK.error)}</div>`;
+  else if (answered() && !ASK.picks.length) top += `<div class="notice">haiku found no matching session</div>`;
+  if (!results.length) { $list.innerHTML = top + (query ? '' : '<div id="empty">No matching session</div>'); return; }
   const windows = new Set(SESSIONS.filter(x => x.kind === 'open').map(x => x.window));
-  $list.innerHTML = results.map(({s}, i) => {
-    const divider = s.kind !== 'open' && results[i - 1]?.s.kind !== s.kind ? `<div class="divider">${DIVIDER[s.kind]}</div>` : '';
+  $list.innerHTML = top + results.map(({s, ai, why}, i) => {
+    // a pick matched by meaning; its rows would only light up stray question words
+    const terms = ai ? [] : shown;
+    const prev = results[i - 1];
+    const divider = ai && !prev ? `<div class="divider">Haiku's picks</div>`
+      : !ai && prev?.ai ? `<div class="divider">${s.kind === 'open' ? 'Matches' : DIVIDER[s.kind]}</div>`
+      : s.kind !== 'open' && !ai && prev?.s.kind !== s.kind ? `<div class="divider">${DIVIDER[s.kind]}</div>` : '';
     const closed = s.kind !== 'open';
     const where = [s.workspace, s.cwd.replace(/^\/Users\/[^/]+/, '~')].filter(Boolean)
       .concat(!closed && windows.size > 1 ? [s.windowName] : []);
@@ -145,6 +172,7 @@ function render(terms) {
     return `${divider}<div class="row${i === sel ? ' sel' : ''}${closed ? ' closed' : ''}" data-i="${i}">
       <div class="head"><span class="dot ${closed ? 'closed' : s.status}"></span><span class="name">${highlight(s.name, terms)}</span>
         <span class="where">${highlight(where.join(' · '), terms)}</span>${when ? `<span class="when">${when}</span>` : ''}</div>
+      ${why ? `<div class="why"><span class="tag">haiku</span>${esc(why)}</div>` : ''}
       ${line ? `<div class="line">${lineTag ? `<span class="tag">${lineTag}</span>` : ''}${highlight(line, terms)}</div>` : ''}
       ${snips.map(n => `<div class="snip"><span class="tag">${SNIPPET_LABELS[n.field]}</span>${highlight(n.text, terms)}</div>`).join('')}
     </div>`;
@@ -153,10 +181,21 @@ function render(terms) {
 }
 
 function move(d) {
-  if (!results.length) return;
-  sel = (sel + d + results.length) % results.length;
+  const first = $q.value.trim() ? -1 : 0, n = results.length - first;
+  if (n <= 0) return;
+  sel = ((sel - first + d) % n + n) % n + first;
   $list.querySelectorAll('.row').forEach((r, i) => r.classList.toggle('sel', i === sel));
+  document.getElementById('ask')?.classList.toggle('sel', sel === -1);
   $list.querySelector('.sel')?.scrollIntoView({block: 'nearest'});
+}
+
+// the script that opened this page waits for its answer, asks haiku, and reopens the page with the picks
+function ask() {
+  const query = $q.value.trim();
+  if (!query || asking) return;
+  asking = true;
+  render(queryTerms());
+  agterm.request('session.overlay.submit', {args: {value: JSON.stringify({ask: query})}}).catch(() => { asking = false; render(queryTerms()); });
 }
 
 function ago(sec) {
@@ -195,10 +234,13 @@ document.addEventListener('keydown', e => {
   const k = e.key;
   if (k === 'ArrowDown' || (e.ctrlKey && (k === 'j' || k === 'n'))) { move(1); e.preventDefault(); }
   else if (k === 'ArrowUp' || (e.ctrlKey && (k === 'k' || k === 'p'))) { move(-1); e.preventDefault(); }
-  else if (k === 'Enter') { go(sel); e.preventDefault(); }
+  else if (k === 'Enter') { sel === -1 ? ask() : go(sel); e.preventDefault(); }
   else if (k === 'Escape') { close(); e.preventDefault(); }
 });
-$list.addEventListener('click', e => { const r = e.target.closest('.row'); if (r) go(+r.dataset.i); });
+$list.addEventListener('click', e => {
+  if (e.target.closest('#ask')) return ask();
+  const r = e.target.closest('.row'); if (r) go(+r.dataset.i);
+});
 
 function updateMeta() {
   const realized = SESSIONS.filter(s => s.realized).length, count = k => SESSIONS.filter(s => s.kind === k).length;
@@ -206,6 +248,7 @@ function updateMeta() {
     + ` · scrollback ${scrollLoaded}/${realized}`;
 }
 
+if (ASK) $q.value = ASK.query;
 search();
 updateMeta();
 $q.focus();
@@ -217,7 +260,7 @@ for (const s of SESSIONS.filter(s => s.realized)) {
     s._scroll = s.scroll.toLowerCase();
     scrollLoaded++;
     updateMeta();
-    if ($q.value.trim()) { const keep = results[sel]?.s; search(); const j = results.findIndex(x => x.s === keep); if (j >= 0) { sel = j; render($q.value.toLowerCase().split(/\s+/).filter(Boolean)); } }
+    if ($q.value.trim() && !asking) { const keep = results[sel]?.s; search(); const j = results.findIndex(x => x.s === keep); if (keep && j >= 0) { sel = j; render(queryTerms()); } }
   }).catch(() => {});
 }
 </script>

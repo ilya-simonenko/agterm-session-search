@@ -5,6 +5,11 @@ usage:
   session-search.py [AGT_SESSION_ID]   gather sessions and open the search overlay on that session
   session-search.py --summarize        (internal) refresh stale Claude summaries in the background
   session-search.py --dump             print the gathered index as JSON, open nothing
+  session-search.py --ask QUERY        print what haiku picks for QUERY, open nothing
+
+Return on a query with no row selected asks haiku instead: the page answers its blocking opener with the
+query, the session index plus excerpts of the best lexical matches' full transcripts and scrollback go to
+one haiku call, and the overlay reopens with its picks on top.
 
 A session's Claude transcript is found exactly through the live claude process: its
 ~/.claude/sessions/<pid>.json names the transcript and its environment names the agterm session.
@@ -20,6 +25,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 
 HOME = os.path.expanduser("~")
@@ -41,6 +47,31 @@ SUMMARY_DAYS = 14        # past conversations older than this stay searchable by
 SUMMARIES_PER_RUN = 30   # newest first; a first run over a month of history takes a few opens
 SEEN = os.path.join(CACHE, "session-transcripts.json")  # agterm session -> its conversations, for after it closes
 PROMPT_DIGEST = 60000    # transcript text fed to the summarizer
+
+ASK_MODEL = os.environ.get("SESSION_SEARCH_ASK_MODEL", "haiku")
+# user settings cost a nested claude seconds of startup (permission rules, plugins); MCP servers more
+FAST_CLAUDE = ["--no-session-persistence", "--tools", "", "--strict-mcp-config", "--setting-sources", "project"]
+ASK_CANDIDATES = 8   # sessions whose full transcripts and scrollback are searched for excerpts
+ASK_EXCERPTS = 3     # excerpts per candidate
+ASK_EXCERPT = 500    # characters per excerpt
+STOPWORDS = set("""the and for with that this from where what which when was were are you your about session
+sessions find search into have had has did does not but all any can could would should there their them they
+then than its it's our out who how why one some just like""".split())
+
+ASK_PROMPT = """You find terminal sessions for a developer. They are looking for:
+
+  {query}
+
+Every session they have, one per line: #number [state] name | directory | Claude conversation title | summary
+{index}
+
+Excerpts from the full conversations and scrollback of the sessions whose text best matches the request's words:
+{excerpts}
+
+Pick the sessions that match the request, best first, at most 3, only ones that plausibly match. Read the
+request for meaning, not just words: a session can match through its summary or excerpts alone.
+Reply with JSON only, no prose: {{"picks": [{{"n": <number>, "why": "<at most 15 words: what in it matches>"}}]}}
+An empty list when nothing matches."""
 
 SUMMARY_PROMPT = """Below is a Claude Code conversation (user prompts and trimmed assistant replies).
 Write 2-3 plain sentences saying what this session is about: the goal, the components, files or
@@ -176,7 +207,7 @@ def conversation(path, exact, summaries, stale, limit, summarize_window=None):
     fresh = summarize_window is None or time.time() - mtime < summarize_window
     if SUMMARIZE and fresh and (not cached or mtime - cached.get("mtime", 0) > RESUMMARIZE_AFTER):
         stale.append((mtime, path))
-    return {"id": os.path.basename(path)[:-6], "title": parsed["title"], "summary": cached.get("summary", ""),
+    return {"id": os.path.basename(path)[:-6], "path": path, "title": parsed["title"], "summary": cached.get("summary", ""),
             "text": digest(parsed, limit), "mtime": mtime, "exact": exact, "cwd": parsed["cwd"]}
 
 
@@ -291,20 +322,147 @@ def summarize(paths):
         os.remove(lock)
 
 
-def open_overlay(sessions, target):
+def terms_of(query):
+    return list(dict.fromkeys(w for w in re.findall(r"[a-z0-9][a-z0-9_.-]*[a-z0-9]|[a-z0-9]", query.lower())
+                              if (len(w) > 2 or w.isdigit()) and w not in STOPWORDS))
+
+
+def scrollback(sessions):
+    texts = {}
+
+    def fetch(s):
+        try:
+            texts[s["id"]] = ctl("session", "text", "--lines", "400", "--window", s["window"], "--target", s["id"])["text"]
+        except (RuntimeError, ValueError, KeyError, subprocess.TimeoutExpired):
+            pass
+
+    threads = [threading.Thread(target=fetch, args=(s,)) for s in sessions if s["kind"] == "open" and s.get("realized")]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    return texts
+
+
+def raw_texts(path, terms):
+    """Text of every transcript line naming a term: prompts, replies, tool calls and tool output alike."""
+    with open(path, errors="replace") as f:
+        for line in f:
+            low = line.lower()
+            if not any(t in low for t in terms):
+                continue
+            try:
+                content = json.loads(line).get("message", {}).get("content")
+            except (ValueError, AttributeError):
+                continue
+            for block in content if isinstance(content, list) else [{"type": "text", "text": content}]:
+                if not isinstance(block, dict):
+                    continue
+                if block.get("type") == "tool_use":
+                    yield json.dumps(block.get("input"), ensure_ascii=False)
+                elif block.get("type") == "tool_result":
+                    yield text_of(block.get("content"))
+                elif isinstance(block.get("text"), str):
+                    yield block["text"]
+
+
+def excerpts(texts, terms):
+    """The windows around term hits that name the most distinct terms."""
+    found = []
+    for text in texts:
+        low = text.lower()
+        for t in terms:
+            i = low.find(t)
+            while i >= 0 and len(found) < 2000:
+                a = max(0, i - ASK_EXCERPT // 2)
+                window = text[a:a + ASK_EXCERPT]
+                found.append((sum(x in window.lower() for x in terms), " ".join(window.split())))
+                i = low.find(t, i + ASK_EXCERPT)
+    out = []
+    for _, window in sorted(found, key=lambda f: -f[0]):
+        if all(window[:80] not in o for o in out):
+            out.append(window)
+        if len(out) == ASK_EXCERPTS:
+            break
+    return out
+
+
+def ask(query, sessions):
+    """{"picks": [{"i": index into sessions, "why": ...}]} from one haiku call, or {"error": ...}."""
+    terms = terms_of(query)
+    scroll = scrollback(sessions)
+    docs = []
+    for s in sessions:
+        parts = [s["name"], s["context"], s["cwd"], scroll.get(s["id"], "")]
+        for c in s["claude"]:
+            parsed = parse_transcript(c["path"])
+            parts += [c["title"], c["summary"], *parsed["prompts"], *parsed["replies"]]
+        docs.append("\n".join(parts).lower())
+    # tf-idf over the parsed conversations, so a rare word outweighs one every session mentions
+    df = {t: sum(t in d for d in docs) for t in terms}
+    scores = [sum((d.count(t) and 1 + d.count(t) ** 0.5) / df[t] for t in terms if df[t]) for d in docs]
+    candidates = [i for i in sorted(range(len(sessions)), key=lambda i: -scores[i]) if scores[i] > 0][:ASK_CANDIDATES]
+
+    def state(s):
+        if s["kind"] == "open":
+            return "open, " + (s["status"] or "idle")
+        age = round((time.time() - s["closedAt"]) / 3600)
+        when = f"{age}h ago" if age < 48 else f"{age // 24}d ago"
+        return ("closed " if s["kind"] == "recent" else "past conversation, ") + when
+
+    index = "\n".join(
+        f"#{i} [{state(s)}] {s['name']} | {s['cwd']} | {' · '.join(c['title'] for c in s['claude'])} | "
+        + " ".join(c["summary"] for c in s["claude"])[:300] + (f" | context: {s['context']}" if s["context"] else "")
+        for i, s in enumerate(sessions))
+    blocks = []
+    for i in candidates:
+        s = sessions[i]
+        texts = [scroll.get(s["id"], "")] + [t for c in s["claude"] for t in raw_texts(c["path"], terms)]
+        found = excerpts(texts, terms)
+        if found:
+            blocks.append(f"#{i}:\n" + "\n".join(f"  - {e}" for e in found))
+    prompt = ASK_PROMPT.format(query=query, index=index, excerpts="\n".join(blocks) or "(no session uses those words)")
+    try:
+        out = subprocess.run([CLAUDE, "-p", "--model", ASK_MODEL, "--effort", "low", *FAST_CLAUDE], input=prompt,
+                             capture_output=True, text=True, timeout=90, cwd=CACHE, env=CLEAN_ENV)
+    except subprocess.TimeoutExpired:
+        return {"error": "haiku did not answer in 90s"}
+    m = re.search(r"\{.*\}", out.stdout, re.S)
+    try:
+        picks = json.loads(m.group(0))["picks"] if m else None
+    except (ValueError, KeyError, TypeError):
+        picks = None
+    if picks is None:
+        return {"error": (out.stderr.strip() or out.stdout.strip() or "no answer")[:200]}
+    return {"picks": [{"i": p["n"], "why": str(p.get("why", ""))} for p in picks
+                      if isinstance(p, dict) and isinstance(p.get("n"), int) and 0 <= p["n"] < len(sessions)]}
+
+
+def open_overlay(sessions, target, answer=None):
+    """Show the overlay and wait for it; the page's submitted value, or None when it closed without one."""
     with open(os.path.join(os.path.dirname(os.path.realpath(__file__)), "session-search.html")) as f:
         page = f.read()
-    data = json.dumps(sessions).replace("<", "\\u003c")
-    page = page.replace("/*SESSIONS*/[]", data, 1)
+    page = page.replace("/*SESSIONS*/[]", json.dumps(sessions).replace("<", "\\u003c"), 1)
+    page = page.replace("/*ASK*/null", json.dumps(answer).replace("<", "\\u003c"), 1)
     out = os.path.join(CACHE, "page", "session-search.html")
     os.makedirs(os.path.dirname(out), exist_ok=True)
     with open(out, "w") as f:
         f.write(page)
-    args = [AGTERMCTL, "session", "overlay", "open", "--html", out, "--js", "--chromeless",
+    args = [AGTERMCTL, "session", "overlay", "open", "--html", out, "--js", "--chromeless", "--block",
             "--size-percent", "70", *SOCKET]
     if target:
         args += ["--target", target]
-    subprocess.run(args, check=True)
+    reply = subprocess.run(args, capture_output=True, text=True)
+    try:
+        result = json.loads(reply.stdout)
+    except ValueError:
+        return None
+    return result.get("value") if result.get("outcome") == "submitted" else None
+
+
+def hud(target, message):
+    args = [AGTERMCTL, "session", "hud", message, "--spinner", "--hide-after", "90", *SOCKET]
+    subprocess.run(args + (["--target", target] if target else []), capture_output=True)
 
 
 def main():
@@ -316,12 +474,25 @@ def main():
     if sys.argv[1:2] == ["--dump"]:
         json.dump(sessions, sys.stdout, indent=1)
         return
+    if sys.argv[1:2] == ["--ask"]:
+        json.dump(ask(" ".join(sys.argv[2:]), sessions), sys.stdout, indent=1)
+        return
     target = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("AGTERM_SESSION_ID", "")
-    open_overlay(sessions, target)
     if stale:
         subprocess.Popen([sys.executable, os.path.realpath(__file__), "--summarize", *dict.fromkeys(stale)],
                          stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                          start_new_session=True)
+    answer = None
+    while True:
+        value = open_overlay(sessions, target, answer)
+        try:
+            query = json.loads(value or "{}").get("ask", "").strip()
+        except (ValueError, AttributeError):
+            query = ""
+        if not query:
+            return
+        hud(target, f"Asking {ASK_MODEL}: {query}")
+        answer = {"query": query, **ask(query, sessions)}
 
 
 if __name__ == "__main__":

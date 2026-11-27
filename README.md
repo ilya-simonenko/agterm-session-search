@@ -27,7 +27,16 @@ Results come in three groups, always in this order:
    conversation was started in and runs `claude --resume <id>` there.
 
 Closed results are dimmed, carry a dashed status ring, and say when they were closed and what Return does.
-Arrows or ⌃J/⌃K/⌃N/⌃P move, Return acts, Esc closes.
+Arrows or ⌃J/⌃K/⌃N/⌃P move, Return acts, Esc closes. Once you type, nothing is selected until you press an arrow.
+
+### Asking Haiku
+
+Return on a typed query with no row selected asks Claude Haiku instead, so you can describe what you remember:
+"where did I fix the duplicate users". The script looks for your words in the full conversations, including
+tool calls and their output, and in the scrollback of open sessions. One Haiku call then gets every session's
+name, directory, title and summary, plus excerpts from the best matches. The panel reopens with Haiku's picks
+on top, each with a line on why it fits, and Return on the first one goes there. An answer takes about three
+seconds.
 
 ![With no query: open sessions with their status and Claude summaries, then recently closed sessions and past conversations](docs/search-all.png)
 
@@ -112,11 +121,13 @@ Environment variables, set in the keymap line or your shell profile:
 | `SESSION_SEARCH_SUMMARIZE` | `1` | `0` turns off every model call |
 | `SESSION_SEARCH_MODEL` | `haiku` | the summary model |
 | `SESSION_SEARCH_DAYS` | `30` | how far back past conversations go |
+| `SESSION_SEARCH_ASK_MODEL` | `haiku` | the model Return asks when no row is selected |
 | `SESSION_EMOJI_MODEL` | `haiku` | the emoji model |
 | `SESSION_EMOJI_BACKGROUND` | `1` | `0` sets names only, no backgrounds |
 | `SESSION_EMOJI_BG_OPACITY` | `0.55` | how strongly the background shows |
 | `CLAUDE_DIRS` | `~/.claude` | Claude Code config directories to read, space separated |
 
+`session-search.py --ask "QUERY"` prints what Haiku picks without opening anything.
 `session-search.py --dump` prints the index as JSON without opening anything, which is the quickest way to
 see what a search will find.
 
